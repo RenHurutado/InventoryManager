@@ -1,0 +1,825 @@
+# complete_workshop_inventory_fixed.py - Fixed version without indentation errors
+import sqlite3
+import csv
+import os
+import json
+import requests
+from datetime import datetime
+
+class WorkshopInventorySystem:
+    def __init__(self):
+        self.db_name = 'workshop_inventory.db'
+        self.lm_studio_url = "http://localhost:1234"
+        self.llm_connected = False
+        self.use_llm = True  # Toggle for LLM usage
+        self.setup_database()
+        self.test_lm_studio()
+    
+    def setup_database(self):
+        """Create all necessary tables for complete tracking"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        # Main inventory table with location
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS inventory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id TEXT,
+            item_name TEXT NOT NULL,
+            equipment TEXT,
+            brand TEXT,
+            total_stock REAL DEFAULT 0,
+            available_stock REAL DEFAULT 0,
+            location TEXT DEFAULT 'workshop',
+            notes TEXT,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+        
+        # Employees/Users table
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS employees (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_name TEXT NOT NULL UNIQUE,
+            employee_id TEXT,
+            department TEXT,
+            active BOOLEAN DEFAULT 1
+        )
+        ''')
+        
+        # Check-out/Check-in records
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS checkouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER,
+            employee_id INTEGER,
+            quantity REAL,
+            checkout_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expected_return DATE,
+            actual_return TIMESTAMP,
+            location TEXT,
+            purpose TEXT,
+            status TEXT DEFAULT 'checked_out',
+            FOREIGN KEY (item_id) REFERENCES inventory(id),
+            FOREIGN KEY (employee_id) REFERENCES employees(id)
+        )
+        ''')
+        
+        # Item movement history
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS movement_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER,
+            action TEXT,
+            quantity REAL,
+            from_location TEXT,
+            to_location TEXT,
+            employee_id INTEGER,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            notes TEXT,
+            FOREIGN KEY (item_id) REFERENCES inventory(id),
+            FOREIGN KEY (employee_id) REFERENCES employees(id)
+        )
+        ''')
+        
+        # Add some default employees if table is empty
+        cursor.execute("SELECT COUNT(*) FROM employees")
+        if cursor.fetchone()[0] == 0:
+            default_employees = [
+                ('Juan Pérez', 'EMP001', 'Mecánica'),
+                ('María García', 'EMP002', 'Eléctrica'),
+                ('Carlos López', 'EMP003', 'Mantenimiento'),
+                ('Ana Martínez', 'EMP004', 'Producción')
+            ]
+            cursor.executemany('''
+            INSERT INTO employees (employee_name, employee_id, department)
+            VALUES (?, ?, ?)
+            ''', default_employees)
+        
+        conn.commit()
+        conn.close()
+        print("✅ Database initialized with checkout tracking")
+    
+    def test_lm_studio(self):
+        """Test LM Studio connection"""
+        try:
+            response = requests.post(
+                f"{self.lm_studio_url}/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "Say OK"}],
+                    "max_tokens": 10,
+                    "temperature": 0.1
+                },
+                timeout=5
+            )
+            if response.status_code == 200:
+                print("✅ LM Studio connected successfully!")
+                self.llm_connected = True
+                return True
+        except:
+            print("⚠️ LM Studio not connected. Running in manual mode.")
+            self.llm_connected = False
+            return False
+    
+    def reconnect_llm(self):
+        """Try to reconnect to LM Studio"""
+        print("\n🔄 Attempting to reconnect to LM Studio...")
+        print(f"URL: {self.lm_studio_url}")
+        
+        # First check if server is reachable
+        try:
+            response = requests.get(f"{self.lm_studio_url}/v1/models", timeout=2)
+            if response.status_code == 200:
+                print("✅ Server is reachable")
+                models = response.json()
+                if 'data' in models and models['data']:
+                    print(f"✅ Model loaded: {models['data'][0]['id']}")
+                else:
+                    print("⚠️ No model loaded in LM Studio")
+                    return False
+        except Exception as e:
+            print(f"❌ Cannot reach LM Studio: {e}")
+            print("\nPlease ensure:")
+            print("1. LM Studio is running")
+            print("2. Server is started (check Server tab)")
+            print("3. A model is loaded")
+            return False
+        
+        # Test actual LLM functionality
+        return self.test_lm_studio()
+    
+    def ask_llm(self, prompt):
+        """Send prompt to LM Studio"""
+        if not self.llm_connected:
+            return None
+            
+        try:
+            # Better system prompt for command conversion
+            response = requests.post(
+                f"{self.lm_studio_url}/v1/chat/completions",
+                json={
+                    "messages": [
+                        {"role": "system", "content": """You are an inventory assistant. Convert user requests to simple commands.
+                        
+For listing/showing items: respond with 'search [item name]'
+For checkout requests: respond with 'checkout [item name]'  
+For location queries: respond with 'where [item name]'
+For employee queries: respond with 'items [employee name]'
+For checked out items: respond with 'checked_out'
+
+Examples:
+- "show me all 1/4 wrenches" → "search wrench 1/4"
+- "list llave 1/2 items" → "search llave 1/2"
+- "check out a hammer" → "checkout hammer"
+- "where are the torque wrenches" → "where torque"
+- "what does Juan have" → "items Juan"
+
+Respond with ONLY the command, no explanation."""},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_tokens": 50,
+                    "temperature": 0.1
+                }
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result['choices'][0]['message']['content'].strip()
+                
+        except Exception as e:
+            print(f"LLM Error: {e}")
+            
+        return None
+    
+    def import_csv(self, filename='tallerdatabase1.csv'):
+        """Import CSV and set all items to workshop location"""
+        if not os.path.exists(filename):
+            print(f"❌ File '{filename}' not found!")
+            return False
+        
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("DELETE FROM inventory")
+            
+            with open(filename, 'r', encoding='utf-8') as file:
+                csv_reader = csv.DictReader(file)
+                count = 0
+                
+                for row in csv_reader:
+                    if row.get('Item Name') and row['Item Name'].strip() != 'Item Name':
+                        stock_val = float(row.get('Stock', 0)) if row.get('Stock') else 0
+                        cursor.execute('''
+                        INSERT INTO inventory 
+                        (item_id, item_name, equipment, brand, total_stock, available_stock, location, notes)
+                        VALUES (?, ?, ?, ?, ?, ?, 'workshop', ?)
+                        ''', (
+                            row.get('Item ID', ''),
+                            row['Item Name'],
+                            row.get('Equipment', ''),
+                            row.get('Brand', ''),
+                            stock_val,
+                            stock_val,  # Initially all stock is available
+                            row.get('Notes', '')
+                        ))
+                        count += 1
+                
+                conn.commit()
+                print(f"✅ Imported {count} items")
+                return True
+                
+        except Exception as e:
+            print(f"❌ Import error: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def search_items(self, query, limit=None):
+        """Enhanced search with better fraction handling"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        # Simple approach - just search for each word independently
+        words = query.lower().split()
+        
+        if not words:
+            sql = '''
+            SELECT id, item_name, brand, total_stock, available_stock,
+                   (total_stock - available_stock) as checked_out
+            FROM inventory 
+            ORDER BY item_name
+            '''
+            params = []
+        else:
+            # Build query that item must contain ALL words (but not necessarily together)
+            where_parts = []
+            params = []
+            
+            for word in words:
+                # Each word must appear somewhere in the item
+                where_parts.append('(LOWER(item_name) LIKE ? OR LOWER(brand) LIKE ?)')
+                params.extend([f'%{word}%', f'%{word}%'])
+            
+            where_clause = ' AND '.join(where_parts)
+            sql = f'''
+            SELECT id, item_name, brand, total_stock, available_stock,
+                   (total_stock - available_stock) as checked_out
+            FROM inventory 
+            WHERE {where_clause}
+            ORDER BY item_name
+            '''
+        
+        if limit:
+            sql += f' LIMIT {limit}'
+        
+        cursor.execute(sql, params)
+        results = cursor.fetchall()
+        conn.close()
+        return results
+    
+    def get_item_location(self, search_term):
+        """Find where items are with better search"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        # Use the same enhanced search logic
+        # First, get matching items using our better search
+        items = self.search_items(search_term)
+        
+        results = []
+        for item in items:
+            item_id = item[0]
+            
+            # Get who has it checked out
+            cursor.execute('''
+            SELECT e.employee_name, c.quantity, c.location, c.checkout_date, c.purpose
+            FROM checkouts c
+            JOIN employees e ON c.employee_id = e.id
+            WHERE c.item_id = ? AND c.status = 'checked_out'
+            ORDER BY c.checkout_date DESC
+            ''', (item_id,))
+            
+            checkouts = cursor.fetchall()
+            
+            results.append({
+                'id': item_id,
+                'name': item[1],
+                'brand': item[2],
+                'total': item[3],
+                'available': item[4],
+                'checked_out': item[5],
+                'locations': checkouts
+            })
+        
+        conn.close()
+        return results
+    
+    def checkout_item(self, item_id, employee_name, quantity, location='field', order_number='', return_date=None):
+        """Check out an item to an employee with order number"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        try:
+            # Get employee ID
+            cursor.execute("SELECT id FROM employees WHERE LOWER(employee_name) = LOWER(?)", (employee_name,))
+            emp = cursor.fetchone()
+            if not emp:
+                # Create new employee
+                cursor.execute("INSERT INTO employees (employee_name) VALUES (?)", (employee_name,))
+                employee_id = cursor.lastrowid
+            else:
+                employee_id = emp[0]
+            
+            # Check available stock
+            cursor.execute("SELECT item_name, available_stock FROM inventory WHERE id = ?", (item_id,))
+            item = cursor.fetchone()
+            if not item:
+                return False, f"Item #{item_id} not found"
+            
+            if item[1] < quantity:
+                return False, f"Not enough stock. Available: {item[1]}"
+            
+            # Create checkout record
+            cursor.execute('''
+            INSERT INTO checkouts 
+            (item_id, employee_id, quantity, location, purpose, expected_return)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ''', (item_id, employee_id, quantity, location, order_number, return_date))
+            
+            # Update available stock
+            cursor.execute('''
+            UPDATE inventory 
+            SET available_stock = available_stock - ?
+            WHERE id = ?
+            ''', (quantity, item_id))
+            
+            # Log movement
+            cursor.execute('''
+            INSERT INTO movement_history 
+            (item_id, action, quantity, from_location, to_location, employee_id, notes)
+            VALUES (?, 'checkout', ?, 'workshop', ?, ?, ?)
+            ''', (item_id, quantity, location, employee_id, f"Order: {order_number}"))
+            
+            conn.commit()
+            return True, f"Checked out {quantity} x {item[0]} to {employee_name} (Order: {order_number})"
+            
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+        finally:
+            conn.close()
+    
+    def interactive_checkout_with_search(self, search_term):
+        """Interactive checkout with pre-populated search term"""
+        print("\n📤 CHECKOUT PROCESS")
+        print("-" * 40)
+        print(f"Searching for: {search_term}")
+        
+        # Search for item
+        results = self.search_items(search_term, limit=10)
+        
+        if not results:
+            print("No items found matching your search.")
+            return False, "No items found"
+        
+        # Display search results
+        print(f"\nFound {len(results)} items:")
+        print(f"{'#':<4} {'ID':<5} {'Name':<30} {'Brand':<15} {'Avail':<7}")
+        print("-" * 70)
+        
+        for i, r in enumerate(results, 1):
+            print(f"{i:<4} {r[0]:<5} {r[1][:30]:<30} {r[2][:15]:<15} {r[4]:<7.0f}")
+        
+        # Continue with rest of checkout process
+        if len(results) == 1:
+            choice = 1
+            print(f"\nAuto-selecting the only result: {results[0][1]}")
+        else:
+            try:
+                choice = int(input(f"\nSelect item (1-{len(results)}) or 0 to cancel: "))
+                if choice == 0:
+                    return False, "Checkout cancelled"
+                if choice < 1 or choice > len(results):
+                    return False, "Invalid selection"
+            except:
+                return False, "Invalid selection"
+        
+        selected_item = results[choice - 1]
+        item_id = selected_item[0]
+        item_name = selected_item[1]
+        available = selected_item[4]
+        
+        print(f"\n✓ Selected: {item_name} (Available: {available})")
+        
+        # Get quantity
+        try:
+            quantity = float(input(f"How many units? (max {available}): "))
+            if quantity <= 0 or quantity > available:
+                return False, "Invalid quantity"
+        except:
+            return False, "Invalid quantity"
+        
+        # Get employee name
+        employee = input("Employee name: ").strip()
+        if not employee:
+            return False, "Employee name required"
+        
+        # Get location
+        location = input("Location (default: field): ").strip() or "field"
+        
+        # Get order number
+        order_number = input("Order/Work Number: ").strip()
+        
+        # Get return date
+        return_date = input("Expected return date (YYYY-MM-DD) or Enter to skip: ").strip()
+        
+        # Confirm checkout
+        print(f"\n📋 CONFIRM CHECKOUT:")
+        print(f"Item: {item_name}")
+        print(f"Quantity: {quantity}")
+        print(f"Employee: {employee}")
+        print(f"Location: {location}")
+        print(f"Order Number: {order_number}")
+        if return_date:
+            print(f"Return by: {return_date}")
+        
+        confirm = input("\nConfirm checkout? (y/n): ").lower()
+        if confirm != 'y':
+            return False, "Checkout cancelled"
+        
+        # Process checkout
+        return self.checkout_item(item_id, employee, quantity, location, order_number, return_date or None)
+    
+    def interactive_checkout(self):
+        """Interactive checkout with search"""
+        print("\n📤 CHECKOUT PROCESS")
+        print("-" * 40)
+        
+        # Step 1: Search for item
+        search_term = input("What item do you want to check out? ")
+        return self.interactive_checkout_with_search(search_term)
+    
+    def get_employee_items(self, employee_name):
+        """Get all items checked out by an employee"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        SELECT c.id, i.item_name, i.brand, c.quantity, c.checkout_date, c.location, c.purpose
+        FROM checkouts c
+        JOIN inventory i ON c.item_id = i.id
+        JOIN employees e ON c.employee_id = e.id
+        WHERE LOWER(e.employee_name) LIKE LOWER(?) AND c.status = 'checked_out'
+        ORDER BY c.checkout_date DESC
+        ''', (f'%{employee_name}%',))
+        
+        results = cursor.fetchall()
+        conn.close()
+        return results
+    
+    def get_summary(self):
+        """Enhanced summary with location info"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        # Basic stats
+        cursor.execute("""
+        SELECT COUNT(*), SUM(total_stock), SUM(available_stock)
+        FROM inventory
+        """)
+        total_items, total_stock, available_stock = cursor.fetchone()
+        
+        # Checked out stats
+        cursor.execute("""
+        SELECT COUNT(*), SUM(quantity)
+        FROM checkouts
+        WHERE status = 'checked_out'
+        """)
+        active_checkouts, items_out = cursor.fetchone()
+        
+        # Low stock
+        cursor.execute("SELECT COUNT(*) FROM inventory WHERE available_stock <= 2")
+        low_stock = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        return {
+            'total_items': total_items,
+            'total_stock': total_stock or 0,
+            'available_stock': available_stock or 0,
+            'checked_out_stock': (total_stock or 0) - (available_stock or 0),
+            'active_checkouts': active_checkouts or 0,
+            'items_out': items_out or 0,
+            'low_stock': low_stock
+        }
+
+def print_location_results(results):
+    """Pretty print location search results"""
+    for item in results:
+        print(f"\n{'='*60}")
+        print(f"Item: {item['name']} ({item['brand']}) - ID #{item['id']}")
+        print(f"Total: {item['total']} | Available: {item['available']} | Checked Out: {item['checked_out']}")
+        
+        if item['locations']:
+            print("\nChecked out to:")
+            for emp, qty, loc, date, order in item['locations']:
+                print(f"  • {emp}: {qty} units at {loc}")
+                print(f"    Date: {date[:10]} | Order: {order or 'Not specified'}")
+        else:
+            print("✓ All units in workshop")
+
+def print_help():
+    """Print help with new commands"""
+    print("\n📋 COMMANDS:")
+    print("\n🔍 Search & Location:")
+    print("  search [term] - Search items")
+    print("  where [item] - See item locations and who has them")
+    print("  who has [item] - Same as where")
+    print("  all - Show all items")
+    
+    print("\n📤 Check Out/In:")
+    print("  checkout - Interactive checkout with search")
+    print("  checkout [item_id] [employee] [qty] [location] [order] - Direct checkout")
+    print("  take [item] - Quick checkout (searches and checks out)")
+    print("  checkin [checkout_id] - Return an item")
+    
+    print("\n👥 Employee Queries:")
+    print("  items [employee] - What employee has checked out")
+    print("  overdue - Items that should be returned")
+    
+    print("\n📊 Management:")
+    print("  add [name] [brand] [stock] - Add new item")
+    print("  update [id] [stock] - Update total stock")
+    print("  summary - Inventory statistics")
+    print("  export - Export to CSV")
+    
+    print("\n🤖 System:")
+    print("  mode - Toggle between LLM and Manual mode")
+    print("  connect - Try to connect to LM Studio")
+    print("  status - Check LLM connection status")
+    print()
+
+def main():
+    print("🔧 WORKSHOP INVENTORY SYSTEM")
+    print("=" * 60)
+    
+    # Initialize
+    inv = WorkshopInventorySystem()
+    
+    # Import data if needed
+    conn = sqlite3.connect(inv.db_name)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM inventory")
+    if cursor.fetchone()[0] == 0:
+        print("Importing initial data...")
+        inv.import_csv()
+    conn.close()
+    
+    print("\n✅ System ready!")
+    print(f"LLM Status: {'Connected' if inv.llm_connected else 'Not connected (use \"connect\" to retry)'}")
+    print("Type 'help' for commands or 'exit' to quit\n")
+    
+    while True:
+        user_input = input(">>> ").strip()
+        
+        if user_input.lower() == 'exit':
+            break
+        
+        elif user_input.lower() == 'help':
+            print_help()
+            continue
+        
+        # Parse command
+        parts = user_input.lower().split()
+        if not parts:
+            continue
+        
+        # Where is / Who has commands
+        if parts[0] in ['where', 'who'] or 'where' in user_input or 'who has' in user_input:
+            # Extract item name
+            search_term = ' '.join(p for p in parts if p not in ['where', 'who', 'has', 'is'])
+            results = inv.get_item_location(search_term)
+            if results:
+                print_location_results(results)
+            else:
+                print("No items found")
+        
+        # Quick take/checkout command
+        elif parts[0] == 'take' and len(parts) > 1:
+            # Search and checkout in one command
+            search_term = ' '.join(parts[1:])
+            print(f"\n🔍 Searching for '{search_term}'...")
+            results = inv.search_items(search_term, limit=5)
+            
+            if not results:
+                print("No items found.")
+            elif len(results) == 1:
+                # Only one result, proceed with checkout
+                item = results[0]
+                print(f"Found: {item[1]} ({item[2]}) - Available: {item[4]}")
+                
+                try:
+                    quantity = float(input("Quantity to take: "))
+                    employee = input("Your name: ")
+                    location = input("Location (default: field): ") or "field"
+                    order_number = input("Order Number: ")
+                    
+                    success, msg = inv.checkout_item(item[0], employee, quantity, location, order_number)
+                    print(msg)
+                except:
+                    print("Checkout cancelled")
+            else:
+                # Multiple results, use interactive
+                print(f"Found {len(results)} items. Using interactive checkout...")
+                success, msg = inv.interactive_checkout()
+                print(msg)
+        
+        # Checkout command
+        elif parts[0] == 'checkout':
+            # If full command provided, use old method
+            if len(parts) >= 4:
+                try:
+                    item_id = int(parts[1])
+                    employee = parts[2]
+                    quantity = float(parts[3])
+                    location = parts[4] if len(parts) > 4 else 'field'
+                    order_number = ' '.join(parts[5:]) if len(parts) > 5 else ''
+                    
+                    success, msg = inv.checkout_item(item_id, employee, quantity, location, order_number)
+                    print(msg)
+                except:
+                    print("Error in checkout. Use 'checkout' alone for interactive mode.")
+            else:
+                # Use interactive checkout
+                success, msg = inv.interactive_checkout()
+                print(f"\n{msg}")
+        
+        # Toggle LLM mode
+        elif parts[0] == 'mode':
+            inv.use_llm = not inv.use_llm
+            mode = "LLM" if inv.use_llm else "Manual"
+            print(f"Switched to {mode} mode")
+            if inv.use_llm and not inv.llm_connected:
+                print("Warning: LLM not connected. Use 'connect' to connect to LM Studio")
+        
+        # Connect to LLM
+        elif parts[0] == 'connect':
+            inv.reconnect_llm()
+        
+        # Check LLM status
+        elif parts[0] == 'status':
+            if inv.llm_connected:
+                print("✅ LLM is connected and ready")
+                print(f"URL: {inv.lm_studio_url}")
+            else:
+                print("❌ LLM is not connected")
+                print("Use 'connect' to try reconnecting")
+        
+        # Search command with proper "search all" support
+        elif parts[0] == 'search':
+            # Check if user wants to see all results
+            if len(parts) > 1 and parts[1] == 'all':
+                # "search all [term]" format
+                terms = ' '.join(parts[2:])
+                results = inv.search_items(terms, limit=None)
+            else:
+                # Regular search with limit
+                terms = ' '.join(parts[1:])
+                results = inv.search_items(terms, limit=20)
+            
+            # Debug: Show what we're searching for
+            print(f"[DEBUG] Searching for: '{terms}' (words: {terms.split()})")
+                
+            if results:
+                if len(results) > 20 and parts[0:2] != ['search', 'all']:
+                    print(f"\nFound {len(results)} items (showing first 20, use 'search all {terms}' to see all):")
+                else:
+                    print(f"\nFound {len(results)} items:")
+                    
+                print(f"{'ID':<5} {'Name':<30} {'Brand':<15} {'Total':<7} {'Avail':<7} {'Out':<5}")
+                print("-" * 80)
+                
+                # Show appropriate number of results
+                items_to_show = results if (len(parts) > 1 and parts[1] == 'all') or len(results) <= 20 else results[:20]
+                
+                for r in items_to_show:
+                    print(f"{r[0]:<5} {r[1][:30]:<30} {r[2][:15]:<15} {r[3]:<7.0f} {r[4]:<7.0f} {r[5]:<5.0f}")
+            else:
+                print("No items found")
+                # Debug: Let's see what's in the database
+                print("\n[DEBUG] Let's check what's in the database with '1/4':")
+                conn = sqlite3.connect(inv.db_name)
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, item_name FROM inventory WHERE item_name LIKE '%1/4%' OR item_name LIKE '%1-1/4%'")
+                debug_results = cursor.fetchall()
+                for r in debug_results[:5]:
+                    print(f"  ID {r[0]}: {r[1]}")
+                conn.close()
+        
+        # Summary
+        elif parts[0] == 'summary':
+            stats = inv.get_summary()
+            print("\n📊 INVENTORY SUMMARY:")
+            print(f"Total unique items: {stats['total_items']}")
+            print(f"Total stock: {stats['total_stock']:.0f} units")
+            print(f"Available in workshop: {stats['available_stock']:.0f} units")
+            print(f"Checked out: {stats['checked_out_stock']:.0f} units")
+            print(f"Active checkouts: {stats['active_checkouts']}")
+            print(f"Low stock items: {stats['low_stock']}")
+        
+        # Natural language processing with LLM
+        else:
+            # Check if we should use LLM
+            if inv.use_llm and inv.llm_connected:
+                # Try with LLM
+                llm_response = inv.ask_llm(user_input)
+                if llm_response:
+                    print(f"Interpreted as: {llm_response}")
+                    
+                    # Execute the interpreted command as if user typed it
+                    command_parts = llm_response.lower().strip().split()
+                    
+                    if not command_parts:
+                        continue
+                    
+                    action = command_parts[0]
+                    
+                    # Route to appropriate handler
+                    if action == 'checkout':
+                        if len(command_parts) > 1:
+                            search_term = ' '.join(command_parts[1:])
+                            success, msg = inv.interactive_checkout_with_search(search_term)
+                        else:
+                            success, msg = inv.interactive_checkout()
+                        print(f"\n{msg}")
+                    
+                    elif action == 'search':
+                        search_term = ' '.join(command_parts[1:]) if len(command_parts) > 1 else ''
+                        results = inv.search_items(search_term, limit=None)
+                        if results:
+                            print(f"\nFound {len(results)} items:")
+                            print(f"{'ID':<5} {'Name':<30} {'Brand':<15} {'Total':<7} {'Avail':<7} {'Out':<5}")
+                            print("-" * 80)
+                            for r in results:
+                                print(f"{r[0]:<5} {r[1][:30]:<30} {r[2][:15]:<15} {r[3]:<7.0f} {r[4]:<7.0f} {r[5]:<5.0f}")
+                        else:
+                            print("No items found")
+                    
+                    elif action == 'where':
+                        search_term = ' '.join(command_parts[1:]) if len(command_parts) > 1 else ''
+                        results = inv.get_item_location(search_term)
+                        if results:
+                            print_location_results(results)
+                        else:
+                            print("No items found")
+                    
+                    elif action == 'items':
+                        if len(command_parts) > 1:
+                            employee = ' '.join(command_parts[1:])
+                            items = inv.get_employee_items(employee)
+                            if items:
+                                print(f"\nItems checked out by {employee}:")
+                                for checkout_id, name, brand, qty, date, loc, order in items:
+                                    print(f"  Checkout #{checkout_id}: {name} ({brand}) - {qty} units")
+                                    print(f"    Location: {loc} | Date: {date[:10]} | Order: {order or 'N/A'}")
+                            else:
+                                print(f"No items checked out by {employee}")
+                    
+                    elif action == 'checked_out':
+                        conn = sqlite3.connect(inv.db_name)
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                        SELECT i.item_name, i.brand, c.quantity, e.employee_name, c.location, c.checkout_date, c.purpose
+                        FROM checkouts c
+                        JOIN inventory i ON c.item_id = i.id
+                        JOIN employees e ON c.employee_id = e.id
+                        WHERE c.status = 'checked_out'
+                        ORDER BY c.checkout_date DESC
+                        ''')
+                        
+                        items = cursor.fetchall()
+                        conn.close()
+                        
+                        if items:
+                            print(f"\n📋 Currently Checked Out Items ({len(items)} total):")
+                            print("-" * 80)
+                            for name, brand, qty, emp, loc, date, order in items:
+                                print(f"{name} ({brand}) - {qty} units")
+                                print(f"  → {emp} at {loc} | {date[:10]} | Order: {order or 'N/A'}")
+                        else:
+                            print("\nNo items currently checked out.")
+                    
+                else:
+                    print("Command not recognized. Type 'help' for available commands.")
+            else:
+                # Manual mode or LLM not connected
+                if not inv.use_llm:
+                    print("Manual mode: Command not recognized. Type 'help' for available commands.")
+                else:
+                    print("LLM not connected. Use 'connect' to connect or 'mode' to switch to manual mode.")
+        
+        print()
+
+if __name__ == "__main__":
+    main()
