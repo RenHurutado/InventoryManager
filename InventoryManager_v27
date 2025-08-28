@@ -1,4 +1,4 @@
-# complete_workshop_inventory_fixed.py - Fixed version without indentation errors
+# complete_workshop_inventory_fixed.py
 import sqlite3
 import csv
 import os
